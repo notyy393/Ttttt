@@ -1,0 +1,92 @@
+name: Persistent VPS (Ubuntu 24.04 Upgraded)
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
+  workflow_dispatch:
+
+jobs:
+  vps:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Update & Upgrade System
+        run: |
+          sudo apt update && sudo apt upgrade -y
+          sudo apt install -y curl unzip sudo net-tools neofetch tmate
+
+      - name: Set hostname
+        run: sudo hostnamectl set-hostname biralo
+
+      - name: Restore VPS Backup
+        uses: actions/download-artifact@v4
+        with:
+          name: vps-backup
+          path: ./backup
+        continue-on-error: true
+
+      - name: Unzip Backup (if exists)
+        run: |
+          if [ -f ./backup/backup.zip ]; then
+            unzip -o ./backup/backup.zip -d /
+            echo "✅ Backup Restored"
+          else
+            echo "❌ No backup found"
+          fi
+
+      - name: Install Tailscale
+        run: curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Restore Tailscale State
+        run: |
+          if [ -f /opt/vps-backup/data/tailscaled.state ]; then
+            sudo mkdir -p /var/lib/tailscale
+            sudo cp /opt/vps-backup/data/tailscaled.state /var/lib/tailscale/tailscaled.state
+            sudo chmod 600 /var/lib/tailscale/tailscaled.state
+          fi
+
+      - name: Start Tailscale
+        run: |
+          sudo tailscaled &
+          sleep 5
+          sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=biralo || echo "Already connected"
+
+      - name: Create biralo user with sudo
+        run: |
+          if ! id -u biralo >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash biralo
+            echo "biralo:biralo" | sudo chpasswd
+            sudo usermod -aG sudo biralo
+            echo "biralo ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/biralo
+          fi
+
+      - name: Start tmate SSH Session
+        uses: mxschmitt/action-tmate@v3
+
+      - name: Show VPS Info
+        run: |
+          echo "🔑 Tailscale IP:"
+          tailscale ip -4 || echo "No Tailscale IP"
+          echo ""
+          echo "🧠 System Info:"
+          neofetch || echo "Neofetch not installed"
+
+      - name: Keep VPS Alive
+        run: sleep 21600  # 6 hours
+
+      - name: Backup VPS State
+        run: |
+          sudo mkdir -p /opt/vps-backup/data
+          sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/ || echo "No tailscale state"
+          sudo chown -R $USER:$USER /opt/vps-backup
+          zip -r backup.zip /opt/vps-backup
+
+      - name: Upload Backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps-backup
+          path: backup.zip
