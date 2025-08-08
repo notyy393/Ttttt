@@ -1,64 +1,92 @@
-#!/bin/bash
+name: Continuous Persistent VPS
 
-# === VPS Auto Setup Script ===
-# Includes: Tailscale, SSHX, Persistent Storage, File Server, Auto Restart
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
+  workflow_dispatch:
 
-echo "🛠️ Starting Full VPS Setup..."
+jobs:
+  vps-session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # Just under 6 hours
 
-# Update & install base packages
-sudo apt update && sudo apt install curl unzip cron python3 -y
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-# === Setup Persistent Folder ===
-mkdir -p ~/my-storage
-chmod 755 ~/my-storage
+      - name: Set hostname to notyet
+        run: sudo hostnamectl set-hostname notyet
 
-# === Setup Python File Server (port 6969) ===
-cat <<EOF | sudo tee /etc/systemd/system/fileserver.service >/dev/null
-[Unit]
-Description=Python File Server
-After=network.target
+      - name: Download VPS backup (if any)
+        uses: actions/download-artifact@v4
+        with:
+          name: vps-backup
+          path: ./backup
+        continue-on-error: true
 
-[Service]
-Type=simple
-WorkingDirectory=/home/$USER/my-storage
-ExecStart=/usr/bin/python3 -m http.server 6969
-Restart=always
-User=$USER
+      - name: Install prerequisites
+        run: |
+          sudo apt update
+          sudo apt install -y tmate curl unzip sudo net-tools neofetch
 
-[Install]
-WantedBy=multi-user.target
-EOF
+      - name: Install Tailscale official script
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
 
-sudo systemctl daemon-reload
-sudo systemctl enable fileserver
-sudo systemctl start fileserver
+      - name: Restore backup files
+        run: |
+          if [ -f ./backup/backup.zip ]; then
+            unzip -o ./backup/backup.zip -d /
+          else
+            echo "No backup found, starting fresh"
+          fi
 
-# === Setup Tailscale ===
-echo "📡 Installing Tailscale..."
-curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).tailscale.list | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
-sudo apt update && sudo apt install tailscale -y
-sudo systemctl enable --now tailscaled
+      - name: Restore Tailscale state
+        run: |
+          if [ -f /opt/vps-backup/data/tailscaled.state ]; then
+            sudo mkdir -p /var/lib/tailscale
+            sudo cp /opt/vps-backup/data/tailscaled.state /var/lib/tailscale/tailscaled.state
+            sudo chmod 600 /var/lib/tailscale/tailscaled.state
+          fi
 
-# Manual login step
-echo "🔑 Login to Tailscale (click link below):"
-sudo tailscale up --ssh
+      - name: Start Tailscale
+        run: |
+          sudo tailscaled &
+          sleep 8
+          sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=notyet || echo "Tailscale already up"
 
-# === Setup SSHX ===
-echo "🌐 Installing SSHX..."
-curl -s https://raw.githubusercontent.com/zeekrey/sshx/main/install.sh | bash
-echo "✅ SSHX installed. Run 'sshx' to get public terminal link."
+      - name: Create user notyet with sudo
+        run: |
+          if ! id -u notyet >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash notyet
+            echo "notyet:notyet" | sudo chpasswd
+            sudo usermod -aG sudo notyet
+            echo "notyet ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/notyet
+          fi
 
-# === Auto Restart Every 6 Hours ===
-echo "⏰ Setting VPS to restart every 6 hours..."
-(crontab -l 2>/dev/null; echo "0 */6 * * * /sbin/reboot") | crontab -
+      - name: Start tmate session for SSH access
+        uses: mxschmitt/action-tmate@v3
 
-# === Summary ===
-echo "✅ Setup Complete!"
-echo "---------------------------"
-echo "📁 Storage Folder: ~/my-storage"
-echo "🌍 File Server: http://$(tailscale ip | head -n 1):6969"
-echo "🔐 Tailscale SSH: ssh $USER@$(tailscale ip | head -n 1)"
-echo "🌐 SSHX Terminal: Run 'sshx'"
-echo "♻️ VPS will auto-reboot every 6 hours"
-echo "---------------------------"
+      - name: Show Tailscale IP and tmate info
+        run: |
+          echo "🔗 Tailscale IP:"
+          tailscale ip -4 || echo "Tailscale IP not found"
+          echo ""
+          echo "🔑 tmate SSH session:"
+          cat $HOME/.tmate.sock/ssh
+
+      - name: Sleep to keep VPS alive
+        run: sleep 21600  # 6 hours
+
+      - name: Backup VPS data and tailscale state
+        run: |
+          sudo mkdir -p /opt/vps-backup/data
+          sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/
+          sudo chown -R $USER:$USER /opt/vps-backup
+          zip -r backup.zip /opt/vps-backup
+
+      - name: Upload VPS backup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps-backup
+          path: backup.zip
