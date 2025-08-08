@@ -1,9 +1,9 @@
-name: Full Root VPS via Tailscale (Ubuntu 24.04)
+name: Persistent GitHub VPS
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'  # Every 6 hours
+    - cron: '0 */6 * * *'  # Run every 6 hours to stay alive
+  workflow_dispatch:
 
 jobs:
   vps:
@@ -11,43 +11,74 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Checkout code
+      - name: Checkout repo
         uses: actions/checkout@v4
+
+      - name: Set hostname
+        run: sudo hostnamectl set-hostname github-vps
+
+      - name: Download VPS backup (if exists)
+        uses: actions/download-artifact@v4
+        with:
+          name: vps-backup
+          path: ./backup
+        continue-on-error: true
 
       - name: Install packages
         run: |
           sudo apt update
-          sudo apt install -y openssh-server curl unzip sudo net-tools neofetch tmate
-
-      - name: Enable and configure SSH
-        run: |
-          sudo systemctl enable ssh
-          sudo mkdir -p /run/sshd
-          echo 'PermitRootLogin yes' | sudo tee -a /etc/ssh/sshd_config
-          echo 'PasswordAuthentication yes' | sudo tee -a /etc/ssh/sshd_config
-          echo 'PermitEmptyPasswords no' | sudo tee -a /etc/ssh/sshd_config
-          echo "root:rootpass" | sudo chpasswd
-          sudo service ssh restart
+          sudo apt install -y tmate curl unzip sudo net-tools neofetch
 
       - name: Install Tailscale
         run: curl -fsSL https://tailscale.com/install.sh | sh
 
-      - name: Start and connect Tailscale
+      - name: Restore Tailscale state
+        run: |
+          if [ -f ./backup/backup.zip ]; then
+            unzip -o ./backup/backup.zip -d /
+          fi
+          if [ -f /opt/vps-backup/data/tailscaled.state ]; then
+            sudo mkdir -p /var/lib/tailscale
+            sudo cp /opt/vps-backup/data/tailscaled.state /var/lib/tailscale/tailscaled.state
+            sudo chmod 600 /var/lib/tailscale/tailscaled.state
+          fi
+
+      - name: Start Tailscale
         run: |
           sudo tailscaled &
-          sleep 8
-          sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --ssh --hostname=gh-vps || echo "Already connected"
+          sleep 10
+          sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=github-vps --reset || echo "Tailscale already connected"
 
-      - name: Show access info
+      - name: Enable root access
         run: |
-          echo "🌐 Tailscale IPv4:"
+          echo 'root:root' | sudo chpasswd
+          sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl restart ssh || sudo service ssh restart
+
+      - name: Show Tailscale IP & connection info
+        run: |
+          echo "✅ Tailscale IP:"
           tailscale ip -4
           echo ""
-          echo "🔑 Login with: ssh root@<tailscale-ip>"
-          echo "🧪 Password: rootpass"
-
-      - name: Start tmate for browser SSH access
-        uses: mxschmitt/action-tmate@v3
+          echo "🔑 tmate SSH session:"
+          sudo apt install -y tmate
+          tmate -F > /tmp/tmate.log 2>&1 &
+          sleep 8
+          cat /tmp/tmate.log || echo "Session info not found"
 
       - name: Keep alive
         run: sleep 21600  # 6 hours
+
+      - name: Backup tailscale state
+        run: |
+          sudo mkdir -p /opt/vps-backup/data
+          sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/
+          sudo chown -R $USER:$USER /opt/vps-backup
+          zip -r backup.zip /opt/vps-backup
+
+      - name: Upload VPS backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps-backup
+          path: backup.zip
