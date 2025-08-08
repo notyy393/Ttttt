@@ -1,84 +1,65 @@
-name: Persistent GitHub VPS
+#!/bin/bash
 
-on:
-  schedule:
-    - cron: '0 */6 * * *'  # Run every 6 hours to stay alive
-  workflow_dispatch:
+# === Full VPS Setup: Tailscale + SSHX + Persistent Storage + Auto Restart ===
 
-jobs:
-  vps:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 350
+# Update system
+sudo apt update && sudo apt upgrade -y
 
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+# Install required packages
+sudo apt install curl unzip gnupg2 lsb-release cron python3 -y
 
-      - name: Set hostname
-        run: sudo hostnamectl set-hostname github-vps
+# === Install & Configure Tailscale ===
+curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).tailscale.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+sudo apt update
+sudo apt install tailscale -y
+sudo systemctl enable tailscaled
+sudo systemctl start tailscaled
 
-      - name: Download VPS backup (if exists)
-        uses: actions/download-artifact@v4
-        with:
-          name: vps-backup
-          path: ./backup
-        continue-on-error: true
+# Login to Tailscale (copy the link after this)
+sudo tailscale up --ssh
 
-      - name: Install packages
-        run: |
-          sudo apt update
-          sudo apt install -y tmate curl unzip sudo net-tools neofetch
+# === Install & Configure SSHX ===
+curl -s https://raw.githubusercontent.com/zeekrey/sshx/main/install.sh | bash
+sshx
 
-      - name: Install Tailscale
-        run: curl -fsSL https://tailscale.com/install.sh | sh
+# === Persistent Storage Folder ===
+mkdir -p ~/my-storage
+echo "✅ Persistent folder created at ~/my-storage"
 
-      - name: Restore Tailscale state
-        run: |
-          if [ -f ./backup/backup.zip ]; then
-            unzip -o ./backup/backup.zip -d /
-          fi
-          if [ -f /opt/vps-backup/data/tailscaled.state ]; then
-            sudo mkdir -p /var/lib/tailscale
-            sudo cp /opt/vps-backup/data/tailscaled.state /var/lib/tailscale/tailscaled.state
-            sudo chmod 600 /var/lib/tailscale/tailscaled.state
-          fi
+# === Python File Server on port 6969 ===
+cat <<EOF | sudo tee /etc/systemd/system/python-server.service
+[Unit]
+Description=Simple Python File Server
+After=network.target
 
-      - name: Start Tailscale
-        run: |
-          sudo tailscaled &
-          sleep 10
-          sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=github-vps --reset || echo "Tailscale already connected"
+[Service]
+WorkingDirectory=/home/$(whoami)/my-storage
+ExecStart=/usr/bin/python3 -m http.server 6969
+Restart=always
+User=$(whoami)
 
-      - name: Enable root access
-        run: |
-          echo 'root:root' | sudo chpasswd
-          sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo systemctl restart ssh || sudo service ssh restart
+[Install]
+WantedBy=multi-user.target
+EOF
 
-      - name: Show Tailscale IP & connection info
-        run: |
-          echo "✅ Tailscale IP:"
-          tailscale ip -4
-          echo ""
-          echo "🔑 tmate SSH session:"
-          sudo apt install -y tmate
-          tmate -F > /tmp/tmate.log 2>&1 &
-          sleep 8
-          cat /tmp/tmate.log || echo "Session info not found"
+sudo systemctl daemon-reload
+sudo systemctl enable python-server.service
+sudo systemctl start python-server.service
 
-      - name: Keep alive
-        run: sleep 21600  # 6 hours
+# === Auto Restart VPS Every 6 Hours ===
+(crontab -l 2>/dev/null; echo "0 */6 * * * /sbin/reboot") | crontab -
 
-      - name: Backup tailscale state
-        run: |
-          sudo mkdir -p /opt/vps-backup/data
-          sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/
-          sudo chown -R $USER:$USER /opt/vps-backup
-          zip -r backup.zip /opt/vps-backup
-
-      - name: Upload VPS backup
-        uses: actions/upload-artifact@v4
-        with:
-          name: vps-backup
-          path: backup.zip
+# === Summary ===
+echo ""
+echo "🎉 SETUP COMPLETE"
+echo "------------------------------"
+echo "✅ Tailscale enabled (auto-start)"
+echo "✅ Static Tailscale IP (via: tailscale ip)"
+echo "✅ SSH over Tailscale: ssh user@tailscale-ip"
+echo "✅ SSHX installed (run: sshx)"
+echo "✅ Auto VPS reboot every 6 hours"
+echo "✅ File storage at: ~/my-storage"
+echo "✅ Access files via browser: http://<tailscale-ip>:6969"
+echo "------------------------------"
+tailscale ip
